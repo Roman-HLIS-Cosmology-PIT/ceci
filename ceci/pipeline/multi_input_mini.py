@@ -1,5 +1,3 @@
-"""Multi-input pipeline using templated paths for backward compatibility."""
-
 from .mini import MiniPipeline
 from .. import minirunner
 from .. import core_aware_runner
@@ -13,8 +11,7 @@ class MultiInputMiniPipeline(MiniPipeline):
     """Pipeline that processes multiple input files using templated paths.
 
     This maintains backward compatibility by storing templated paths in
-    pipeline_files (e.g., "output/file_{number}.txt") and expanding them
-    on-the-fly when creating individual jobs.
+    pipeline_file and expanding them on-the-fly when creating individual jobs.
     """
 
     def __init__(self, *args, pipe_config=None, **kwargs):
@@ -64,9 +61,8 @@ class MultiInputMiniPipeline(MiniPipeline):
         ----------
         input_templates : dict
             Input file path templates with {iterator_id} placeholders
-            Example: {"numbers": "./inputs/numbers{number}.txt"}
         iterator_id : str
-            Name of iterator variable (e.g., "number")
+            Name of iterator variable
         pattern : str
             Regex pattern to extract iterator values
 
@@ -131,37 +127,15 @@ class MultiInputMiniPipeline(MiniPipeline):
         ----------
         input_templates : dict
             File path templates with {iterator_name} placeholders
-            Example: {"numbers": "./inputs/numbers{number}.txt"}
         iterator_name : str
-            Name of iterator variable (e.g., "number")
+            Name of iterator variable
         iterator_values : list
-            Values to substitute (e.g., ['-001', '-002', '-003'])
+            Values to substitute
 
         Returns
         -------
         list of dict
             One dict per iterator value with substituted paths
-
-        Examples
-        --------
-        >>> input_templates = {
-        ...     "numbers": "./inputs/numbers{number}.txt",
-        ...     "config": "./config{number}.yaml"
-        ... }
-        >>> iterator_name = "number"
-        >>> iterator_values = ['-001', '-002']
-        >>> result = _generate_input_sets(input_templates, iterator_name, iterator_values)
-        >>> print(result)
-        [
-            {
-                "numbers": "./inputs/numbers-001.txt",
-                "config": "./config-001.yaml"
-            },
-            {
-                "numbers": "./inputs/numbers-002.txt",
-                "config": "./config-002.yaml"
-            }
-        ]
         """
         input_sets = []
 
@@ -181,12 +155,11 @@ class MultiInputMiniPipeline(MiniPipeline):
         Parameters
         ----------
         concrete_paths : list
-            List of concrete paths like ["output/file-001.txt", "output/file-002.txt"]
-
+            List of concrete paths like
         Returns
         -------
         str
-            Template path like "output/file{number}.txt"
+            Template path
         """
         if not concrete_paths or not self.iterator_name:
             return concrete_paths[0] if concrete_paths else None
@@ -226,11 +199,6 @@ class MultiInputMiniPipeline(MiniPipeline):
         -------
         str
             Concrete path with template substituted
-
-        Examples
-        --------
-        >>> self._expand_template("output/file{number}.txt", 0)
-        "output/file-001.txt"  # if self.iterator_values[0] == "-001"
         """
         if not self.iterator_name:
             return path_or_template
@@ -292,7 +260,7 @@ class MultiInputMiniPipeline(MiniPipeline):
         Returns
         -------
         str
-            Suffix string (e.g., "-001" or "" if no iterator)
+            Suffix string
         """
         if self.iterator_name:
             iterator_value = self.iterator_values[iteration_index]
@@ -310,7 +278,7 @@ class MultiInputMiniPipeline(MiniPipeline):
         output_dir : str
             Directory for this stage/iteration
         suffix : str
-            Suffix to add to filename (e.g., "-001")
+            Suffix to add to filename
 
         Returns
         -------
