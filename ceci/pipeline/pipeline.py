@@ -165,6 +165,7 @@ class Pipeline:
         """
         from .parsl import ParslPipeline
         from .mini import MiniPipeline
+        from .multi_input_mini import MultiInputMiniPipeline
         from .flow_chart import FlowChartPipeline
         from .dry_run import DryRunPipeline
 
@@ -190,7 +191,11 @@ class Pipeline:
             elif run_config["resume"] is False:
                 run_config["resume"] = RESUME_MODE_RESTART
 
-            launcher_dict = dict(parsl=ParslPipeline, mini=MiniPipeline)
+            launcher_dict = dict(
+                parsl=ParslPipeline,
+                mini=MiniPipeline,
+                multi_input_mini=MultiInputMiniPipeline,
+            )
 
             if pipe_config.get("flow_chart", False):
                 pipeline_class = FlowChartPipeline
@@ -205,7 +210,11 @@ class Pipeline:
                     ) from msg
 
             p = pipeline_class(
-                stages, launcher_config, overall_inputs=inputs, modules=modules
+                stages,
+                launcher_config,
+                overall_inputs=inputs,
+                modules=modules,
+                pipe_config=pipe_config,
             )
             p.initialize(inputs, run_config, stages_config)
         return p

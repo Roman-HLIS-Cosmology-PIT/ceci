@@ -215,7 +215,7 @@ class Runner:
         """
         self.nodes = nodes
         self.job_graph = job_graph
-        self.completed_jobs = []
+        self.completed_jobs = set()
         self.running = []
         self.log_dir = log_dir
         self.queued_jobs = list(job_graph.keys())
@@ -390,7 +390,7 @@ class Runner:
         self.running = continuing_jobs
 
         for job in completed_jobs:
-            self.completed_jobs.append(job)
+            self.completed_jobs.add(job)
 
     def _check_availability(self, job):
         # check if there are nodes available to run this job

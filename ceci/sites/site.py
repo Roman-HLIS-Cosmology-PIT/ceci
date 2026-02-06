@@ -29,6 +29,7 @@ class Site:
         requirements = {
             "parsl": ["parsl"],
             "mini": ["psutil"],
+            "multi_input_mini": ["psutil"],
         }
         if launcher not in requirements:  # pragma: no cover
             raise ValueError(f"Unknown launcher '{launcher}'")
@@ -37,7 +38,9 @@ class Site:
         for lib in libs:
             try:
                 with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=DeprecationWarning)
+                    warnings.filterwarnings(
+                        "ignore", category=DeprecationWarning
+                    )
                     __import__(lib)
             except ImportError:  # pragma: no cover
                 missing.append(lib)
@@ -57,6 +60,9 @@ class Site:
         if the method associated to the requested launcher does not exist.
         """
 
+        if launcher == "multi_input_mini":
+            # multi_input_mini is just mini with a different name, so we can use the same configuration
+            launcher = "mini"
         self.check_import(launcher)
         configure = getattr(self, f"configure_for_{launcher}", None)
         if configure is None:  # pragma: no cover
