@@ -28,6 +28,11 @@ class MultiInputMiniPipeline(MiniPipeline):
             self.iterator_name = iterator_config["iterator_id"]
             iterator_pattern = iterator_config["pattern"]
 
+            # Compile regex pattern for job name parsing
+            import re
+
+            self.iterator_regex = re.compile(f"({iterator_pattern})$")
+
             # Get input templates from the inputs section
             input_templates = self.pipe_config.get("inputs", {})
 
@@ -45,6 +50,7 @@ class MultiInputMiniPipeline(MiniPipeline):
             self.iterator_name = None
             self.iterator_values = [None]
             self.input_file_sets = [self.pipe_config.get("inputs", {})]
+            self.iterator_regex = None
 
         # Parse output structure
         output_config = self.pipe_config.get(
@@ -149,13 +155,62 @@ class MultiInputMiniPipeline(MiniPipeline):
 
         return input_sets
 
+    def _make_job_name(self, stage_name, iterator_value):
+        """Create job name using iterator value.
+
+        Parameters
+        ----------
+        stage_name : str
+            Name of the stage
+        iterator_value : str
+            Value of the iterator for this job
+
+        Returns
+        -------
+        str
+            Job name in format "stage_name{iterator_value}"
+        """
+        if iterator_value is None:
+            return stage_name
+        return f"{stage_name}{iterator_value}"
+
+    def _parse_job_name(self, job_name):
+        """Parse job name to extract stage name and iterator value.
+
+        Uses the compiled iterator regex pattern.
+
+        Parameters
+        ----------
+        job_name : str
+            Job name in format "stage_name{iterator_value}"
+
+        Returns
+        -------
+        tuple
+            (stage_name, iterator_value)
+        """
+        if not self.iterator_regex:
+            return job_name, None
+
+        # Use precompiled regex
+        match = self.iterator_regex.search(job_name)
+
+        if match:
+            iterator_value = match.group(1)
+            stage_name = job_name[: match.start()]
+            return stage_name, iterator_value
+
+        # No match - job doesn't have an iterator
+        return job_name, None
+
     def _make_template_path(self, concrete_paths):
         """Convert a list of concrete paths back to a template.
 
         Parameters
         ----------
         concrete_paths : list
-            List of concrete paths like
+            List of concrete paths
+
         Returns
         -------
         str
@@ -183,7 +238,7 @@ class MultiInputMiniPipeline(MiniPipeline):
 
         return template_path
 
-    def _expand_template(self, path_or_template, iteration_index):
+    def _expand_template(self, path_or_template, iterator_value):
         """Expand a template path with the specific iterator value.
 
         This is the KEY function that resolves cross-stage dependencies!
@@ -192,8 +247,8 @@ class MultiInputMiniPipeline(MiniPipeline):
         ----------
         path_or_template : str
             Either a concrete path or a template with {iterator_name}
-        iteration_index : int
-            Which iteration we're on
+        iterator_value : str
+            Iterator value to substitute
 
         Returns
         -------
@@ -207,22 +262,21 @@ class MultiInputMiniPipeline(MiniPipeline):
         template_pattern = f"{{{self.iterator_name}}}"
         if template_pattern in path_or_template:
             # Substitute with the specific value
-            iterator_value = self.iterator_values[iteration_index]
             return path_or_template.replace(
                 template_pattern, str(iterator_value)
             )
 
         return path_or_template
 
-    def _get_output_dir_for_stage(self, stage_name, iteration_index=None):
+    def _get_output_dir_for_stage(self, stage_name, iterator_value=None):
         """Get output directory for a stage/iteration.
 
         Parameters
         ----------
         stage_name : str
             Name of the stage
-        iteration_index : int, optional
-            Index into iterator_values
+        iterator_value : str, optional
+            Iterator value for this job
 
         Returns
         -------
@@ -236,8 +290,7 @@ class MultiInputMiniPipeline(MiniPipeline):
         elif self.output_mode == "by_stage":
             output_dir = os.path.join(base_output_dir, stage_name)
         elif self.output_mode == "by_stage_and_input":
-            if iteration_index is not None and self.iterator_name:
-                iterator_value = self.iterator_values[iteration_index]
+            if iterator_value is not None and self.iterator_name:
                 output_dir = os.path.join(
                     base_output_dir, stage_name, str(iterator_value)
                 )
@@ -249,21 +302,20 @@ class MultiInputMiniPipeline(MiniPipeline):
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
 
-    def _get_iterator_suffix(self, iteration_index):
+    def _get_iterator_suffix(self, iterator_value):
         """Get suffix for output filenames.
 
         Parameters
         ----------
-        iteration_index : int
-            Index into iterator_values
+        iterator_value : str
+            Iterator value for this job
 
         Returns
         -------
         str
             Suffix string
         """
-        if self.iterator_name:
-            iterator_value = self.iterator_values[iteration_index]
+        if self.iterator_name and iterator_value is not None:
             return str(iterator_value)
         else:
             return ""
@@ -314,7 +366,8 @@ class MultiInputMiniPipeline(MiniPipeline):
         outputs_by_tag_lists = collections.defaultdict(list)
 
         for i, input_set in enumerate(self.input_file_sets):
-            job_name = f"{stage.instance_name}[input_{i}]"
+            iterator_value = self.iterator_values[i]
+            job_name = self._make_job_name(stage.instance_name, iterator_value)
 
             # Build input files for this job by expanding ALL templates
             files_for_this_run = {}
@@ -323,7 +376,7 @@ class MultiInputMiniPipeline(MiniPipeline):
             # This resolves cross-stage dependencies!
             for tag, path_template in pipeline_files.items():
                 files_for_this_run[tag] = self._expand_template(
-                    path_template, i
+                    path_template, iterator_value
                 )
 
             # Override with iteration-specific inputs (already concrete)
@@ -331,8 +384,10 @@ class MultiInputMiniPipeline(MiniPipeline):
 
             # Generate outputs for this iteration
             sec = self.stage_execution_config[stage.instance_name]
-            output_dir = self._get_output_dir_for_stage(stage.instance_name, i)
-            suffix = self._get_iterator_suffix(i)
+            output_dir = self._get_output_dir_for_stage(
+                stage.instance_name, iterator_value
+            )
+            suffix = self._get_iterator_suffix(iterator_value)
 
             outputs = {}
             for tag in stage.output_tags():
@@ -350,8 +405,6 @@ class MultiInputMiniPipeline(MiniPipeline):
                 outputs_by_tag_lists[aliased_tag].append(output_path)
 
             # Generate command
-            # generate_full_command() will internally call stage.find_inputs(files_for_this_run)
-            # files_for_this_run already has the correct expanded paths!
             cmd = sec.generate_full_command(
                 files_for_this_run, outputs, self.stages_config
             )
@@ -407,32 +460,31 @@ class MultiInputMiniPipeline(MiniPipeline):
         # Build stage-level DAG once
         stage_dag = self.build_stage_dag()
 
-        # Build job index: (stage, file_index) -> Job
+        # Build job index: (stage, iterator_value) -> Job
         job_index = {}
         for job_name, job in jobs.items():
-            if "[input_" not in job_name:
-                continue
-            stage_name = job_name.split("[input_")[0]
-            i = int(job_name.split("[input_")[1].rstrip("]"))
+            stage_name, iterator_value = self._parse_job_name(job_name)
+
+            # Find the stage object
             for stage in self.stages:
                 if stage.instance_name == stage_name:
-                    job_index[(stage, i)] = job
+                    job_index[(stage, iterator_value)] = job
                     break
 
-        # Replicate dependencies across all files
+        # Replicate dependencies across all iterator values
         depend = {}
-        for i in range(len(self.input_file_sets)):
+        for iterator_value in self.iterator_values:
             for stage in self.stages:
-                key = (stage, i)
+                key = (stage, iterator_value)
                 if key not in job_index:
                     continue
 
                 job = job_index[key]
                 parent_stages = stage_dag[stage]
                 parent_jobs = [
-                    job_index[(ps, i)]
+                    job_index[(ps, iterator_value)]
                     for ps in parent_stages
-                    if (ps, i) in job_index
+                    if (ps, iterator_value) in job_index
                 ]
                 depend[job] = parent_jobs
 
@@ -443,7 +495,7 @@ class MultiInputMiniPipeline(MiniPipeline):
         jobs, _ = self.run_info
 
         print(f"\n{'=' * 60}")
-        print(f"Running multi-input pipeline")
+        print("Running multi-input pipeline")
         print(f"Iterator: {self.iterator_name}")
         print(f"Number of inputs: {len(self.iterator_values)}")
         print(f"Number of stages: {len(self.stages)}")
@@ -503,19 +555,20 @@ Standard output and error streams in {log_dir}/{error.job_name}.out
 
         # Extract outputs from all jobs that were created
         for job_name, job in self.run_info[0].items():
-            # Parse iteration index from job name: "stage_1[input_5]" → 5
-            if "[input_" not in job_name:
+            # Parse job name to get stage and iterator value
+            stage_name, iterator_value = self._parse_job_name(job_name)
+
+            if iterator_value is None:
                 continue
 
-            i = int(job_name.split("[input_")[1].rstrip("]"))
-
             # Find which stage this job belongs to
-            stage_name = job_name.split("[")[0]
             for stage in self.stages:
                 if stage.instance_name == stage_name:
                     # Reconstruct the outputs for this iteration
-                    output_dir = self._get_output_dir_for_stage(stage_name, i)
-                    suffix = self._get_iterator_suffix(i)
+                    output_dir = self._get_output_dir_for_stage(
+                        stage_name, iterator_value
+                    )
+                    suffix = self._get_iterator_suffix(iterator_value)
 
                     for tag in stage.output_tags():
                         aliased_tag = stage.get_aliased_tag(tag)
