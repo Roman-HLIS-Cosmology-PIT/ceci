@@ -1,3 +1,7 @@
+"""
+This code has been generated with the help of an AI: Claude 4.5
+"""
+
 import re
 from pathlib import Path
 

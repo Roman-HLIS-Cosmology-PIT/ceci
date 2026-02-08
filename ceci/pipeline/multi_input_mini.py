@@ -1,7 +1,11 @@
+"""
+This code has been generated with the help of an AI: Claude 4.5
+"""
+
 from .mini import MiniPipeline
-from .. import minirunner
 from .. import core_aware_runner
 from .iterator import Iterator
+from .job_maker import JobMaker
 import os
 from pathlib import Path
 import sys
@@ -11,7 +15,7 @@ class MultiInputMiniPipeline(MiniPipeline):
     """Pipeline that processes multiple input files using templated paths.
 
     This pipeline requires an iterator configuration to process multiple inputs.
-    For single-input pipelines, use MiniPipeline instead.
+    Uses lazy job creation - no job objects stored per iterator value.
     """
 
     def __init__(self, *args, pipe_config=None, **kwargs):
@@ -29,7 +33,7 @@ class MultiInputMiniPipeline(MiniPipeline):
                 "For single-input pipelines, use 'mini' launcher instead."
             )
 
-        # Create iterator object with just id and pattern
+        # Create iterator object
         self.iterator = Iterator(
             iterator_id=iterator_config["iterator_id"],
             pattern=iterator_config["pattern"],
@@ -40,6 +44,9 @@ class MultiInputMiniPipeline(MiniPipeline):
             "output_structure", {"mode": "by_stage"}
         )
         self.output_mode = output_config.get("mode", "by_stage")
+
+        # DON'T store iterator values - keep as generator
+        self.iterator_generator = None
 
         super().__init__(*args, **kwargs)
 
@@ -64,36 +71,50 @@ class MultiInputMiniPipeline(MiniPipeline):
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
 
-    def _make_output_path(self, base_path, output_dir, suffix):
-        """Create output path with proper directory and suffix."""
-        p = Path(base_path)
-        new_filename = f"{p.stem}{suffix}{p.suffix}"
-        return str(Path(output_dir) / new_filename)
-
     def _make_output_template(self, base_path, output_dir):
-        """Create output template path with iterator placeholder.
-
-        Parameters
-        ----------
-        base_path : str
-            Base output path from stage.find_outputs()
-        output_dir : str
-            Directory for this stage
-
-        Returns
-        -------
-        str
-            Template path with {iterator_id} placeholder
-        """
+        """Create output template path with iterator placeholder."""
         p = Path(base_path)
         template_filename = (
             f"{p.stem}{{{self.iterator.iterator_id}}}{p.suffix}"
         )
         return str(Path(output_dir) / template_filename)
 
-    def enqueue_job(self, stage, pipeline_files):
-        """Create multiple jobs using template-based paths."""
+    def _build_resource_priority_map(self):
+        """Build priority map based on resource requirements.
 
+        Returns
+        -------
+        dict
+            {stage_idx: priority} where priority is based on core requirements
+            (lower cores = lower priority number = scheduled first)
+        """
+        # Collect unique resource requirements per stage
+        stage_resources = {}
+        for stage_idx, stage in enumerate(self.stages):
+            sec = self.stage_execution_config[stage.instance_name]
+            cores = sec.threads_per_process * sec.nprocess
+            stage_resources[stage_idx] = cores
+
+        # Create priority mapping: sort by resources ascending
+        unique_resources = sorted(set(stage_resources.values()))
+        resource_to_priority = {
+            cores: priority for priority, cores in enumerate(unique_resources)
+        }
+
+        # Map each stage to its priority
+        stage_priority = {
+            stage_idx: resource_to_priority[cores]
+            for stage_idx, cores in stage_resources.items()
+        }
+
+        return stage_priority
+
+    def enqueue_job(self, stage, pipeline_files):
+        """Store stage metadata in run_info[0]. No job objects created.
+
+        Jobs will be created on-demand by the runner when ready to execute.
+        Stores metadata indexed by stage.instance_name (matches original pattern).
+        """
         # Find the first input template that contains the iterator placeholder
         input_templates = self.pipe_config.get("inputs", {})
         marker = f"{{{self.iterator.iterator_id}}}"
@@ -110,72 +131,43 @@ class MultiInputMiniPipeline(MiniPipeline):
                 f"Available inputs: {list(input_templates.keys())}"
             )
 
-        # Generate values and create jobs on-demand
-        for iterator_value in self.iterator.generate_values(file_path):
-            # Create job name using iterator
-            job_name = self.iterator.make_job_name(
-                stage.instance_name, iterator_value
-            )
+        # Get stage index and execution config
+        stage_idx = self.stages.index(stage)
+        sec = self.stage_execution_config[stage.instance_name]
 
-            # Build input files for this job
-            files_for_this_run = {}
+        # Get base outputs (templates)
+        base_outputs = stage.find_outputs(self.run_config["output_dir"])
 
-            # Expand templates from pipeline_files (previous stage outputs)
-            for tag, path_template in pipeline_files.items():
-                files_for_this_run[tag] = self.iterator.expand_template(
-                    path_template, iterator_value
-                )
+        # Get base output directory (without iterator suffix)
+        output_dir = self._get_output_dir_for_stage(stage.instance_name)
 
-            # Add inputs for this iteration
-            for tag, template in input_templates.items():
-                path = self.iterator.expand_template(template, iterator_value)
-                files_for_this_run[tag] = path
+        # Store stage-level metadata in run_info[0] using stage.instance_name as key
+        # This matches the original pattern where keys are human-readable names
+        self.run_info[0][stage.instance_name] = {
+            "stage": stage,
+            "stage_name": stage.instance_name,
+            "stage_idx": stage_idx,
+            "cores": sec.threads_per_process * sec.nprocess,
+            "nodes": sec.nodes,
+            "input_templates": input_templates,
+            "pipeline_files": pipeline_files,
+            "output_dir": output_dir,
+            "stage_execution_config": sec,
+            "base_outputs": base_outputs,
+        }
 
-            # Generate outputs for this iteration
-            sec = self.stage_execution_config[stage.instance_name]
-            output_dir = self._get_output_dir_for_stage(
-                stage.instance_name, iterator_value
-            )
+        # Create generator (only once, for first stage)
+        if self.iterator_generator is None:
+            self.iterator_generator = self.iterator.generate_values(file_path)
 
-            outputs = {}
-            for tag in stage.output_tags():
-                aliased_tag = stage.get_aliased_tag(tag)
-                base_outputs = stage.find_outputs(
-                    self.run_config["output_dir"]
-                )
-                base_path = base_outputs[aliased_tag]
-                output_path = self._make_output_path(
-                    base_path, output_dir, iterator_value
-                )
-                outputs[aliased_tag] = output_path
-
-            # Generate command
-            cmd = sec.generate_full_command(
-                files_for_this_run, outputs, self.stages_config
-            )
-
-            # Create Job object
-            job = minirunner.Job(
-                job_name,
-                cmd,
-                cores=sec.threads_per_process * sec.nprocess,
-                nodes=sec.nodes,
-            )
-
-            # Store job in run_info
-            self.run_info[0][job_name] = job
-
-        # Add stage to list
+        # Add stage to run_info[1]
         if stage not in self.run_info[1]:
             self.run_info[1].append(stage)
 
-        # Build output templates directly
+        # Build output templates
         templated_outputs = {}
-        output_dir = self._get_output_dir_for_stage(stage.instance_name)
-
         for tag in stage.output_tags():
             aliased_tag = stage.get_aliased_tag(tag)
-            base_outputs = stage.find_outputs(self.run_config["output_dir"])
             base_path = base_outputs[aliased_tag]
             templated_outputs[aliased_tag] = self._make_output_template(
                 base_path, output_dir
@@ -184,7 +176,10 @@ class MultiInputMiniPipeline(MiniPipeline):
         return templated_outputs
 
     def build_stage_dag(self):
-        """Build stage-level dependency graph."""
+        """Build stage-level dependency graph.
+
+        Returns stage dependencies using Stage objects (original convention).
+        """
         output_to_stage = {}
         for stage in self.stages:
             for tag in stage.output_tags():
@@ -205,90 +200,98 @@ class MultiInputMiniPipeline(MiniPipeline):
         return stage_dag
 
     def build_dag(self, jobs):
-        """Build DAG by replicating stage dependencies across files."""
+        """Build compact DAG representation with stage dependencies.
+
+        Parameters
+        ----------
+        jobs : dict
+            run_info[0] containing stage metadata indexed by stage.instance_name
+
+        Returns
+        -------
+        dict
+            Compact representation with stage dependencies and iterator generator
+        """
+        # Build stage-level DAG
         stage_dag = self.build_stage_dag()
 
-        job_index = {}
-        for job_name, job in jobs.items():
-            stage_name, iterator_value = self.iterator.parse_job_name(job_name)
+        # Convert Stage objects to indices
+        stage_to_idx = {stage: idx for idx, stage in enumerate(self.stages)}
 
-            for stage in self.stages:
-                if stage.instance_name == stage_name:
-                    job_index[(stage, iterator_value)] = job
-                    break
+        # Build dependency maps using indices
+        stage_dependencies = {}
+        stage_children = {i: [] for i in range(len(self.stages))}
 
-        depend = {}
+        for stage, parent_stages in stage_dag.items():
+            stage_idx = stage_to_idx[stage]
+            parent_indices = [stage_to_idx[ps] for ps in parent_stages]
+            stage_dependencies[stage_idx] = parent_indices
 
-        # Get all unique iterator values from jobs
-        iterator_values = set()
-        for job_name in jobs.keys():
-            _, iterator_value = self.iterator.parse_job_name(job_name)
-            if iterator_value is not None:
-                iterator_values.add(iterator_value)
-        iterator_values = sorted(iterator_values)
+            # Build reverse map (children)
+            for parent_idx in parent_indices:
+                stage_children[parent_idx].append(stage_idx)
 
-        for iterator_value in iterator_values:
-            for stage in self.stages:
-                key = (stage, iterator_value)
-                if key not in job_index:
-                    continue
-
-                job = job_index[key]
-                parent_stages = stage_dag[stage]
-                parent_jobs = [
-                    job_index[(ps, iterator_value)]
-                    for ps in parent_stages
-                    if (ps, iterator_value) in job_index
-                ]
-                depend[job] = parent_jobs
-
-        return depend
+        # Return compact representation with generator
+        return {
+            "stage_dependencies": stage_dependencies,
+            "stage_children": stage_children,
+            "stage_metadata": jobs,
+            "iterator_generator": self.iterator_generator,
+        }
 
     def run_jobs(self):
-        """Run with core-aware priority scheduling."""
-        jobs, _ = self.run_info
+        """Run with optimized core-aware scheduling."""
+
+        jobs = self.run_info[0]  # Stage metadata dict
 
         print(f"\n{'=' * 60}")
         print("Running multi-input pipeline")
         print(f"Iterator: {self.iterator.iterator_id}")
-        print(f"Number of inputs: {len(jobs) // len(self.stages)}")
         print(f"Number of stages: {len(self.stages)}")
-        print(f"Total jobs: {len(jobs)}")
         print(f"Output mode: {self.output_mode}")
+        print("Discovering inputs lazily...")
         print(f"{'=' * 60}\n")
 
+        # Build DAG structures
         graph = self.build_dag(jobs)
 
+        # Build priority map
+        stage_priority = self._build_resource_priority_map()
+
+        # Create job maker
+        job_maker = JobMaker(
+            self.iterator, self.stages_config, self.run_config
+        )
+
+        # Get execution config
         sec = self.stage_execution_config[self.stage_names[0]]
         nodes = sec.site.info["nodes"]
         log_dir = self.run_config["log_dir"]
 
-        stage_priorities = {
-            stage.instance_name: i for i, stage in enumerate(self.stages)
-        }
-
+        # Create optimized runner
         runner = core_aware_runner.CoreAwareRunner(
-            nodes,
-            graph,
-            log_dir,
-            stage_priorities=stage_priorities,
+            nodes=nodes,
+            graph=graph,
+            job_maker=job_maker,
+            stage_priority=stage_priority,
+            num_stages=len(self.stages),
+            log_dir=log_dir,
             callback=self.callback,
             sleep=self.sleep,
         )
 
         interval = self.launcher_config.get("interval", 3)
-        try:
-            runner.run(interval)
-        except minirunner.FailedJob as error:
+        status = runner.run(interval)
+
+        # Check for failures
+        if runner.failed_count > 0:
             sys.stderr.write(
                 f"""
-*************************************************
-Error running pipeline stage {error.job_name}.
-Failed after {error.run_time}.
-
-Standard output and error streams in {log_dir}/{error.job_name}.out
-*************************************************
-"""
+    *************************************************
+    Pipeline completed with failures.
+    See logs in {log_dir} for details.
+    *************************************************
+    """
             )
             return 1
 
